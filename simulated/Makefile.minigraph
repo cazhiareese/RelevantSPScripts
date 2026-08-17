@@ -1,0 +1,149 @@
+# =============================================================================
+# Makefile.minigraph — Build a minigraph graph for the WHOLE genome (12 chr)
+#                      or for a SINGLE chromosome, from cultivar assemblies.
+# =============================================================================
+#
+# minigraph treats a multi-contig assembly the same as a single chromosome, so
+# both modes share one recipe and differ only in which inputs are used and what
+# the output is named. Pick the mode with SCOPE:
+#
+#   SCOPE=whole   -> whole-genome graph from full assemblies
+#                    input file per cultivar:  <lc-cultivar>.$(EXT)
+#                    e.g.  nipponbare.fna  ir64.fna  azucena.fna
+#
+#   SCOPE=chrN    -> single-chromosome graph
+#                    input file per cultivar:  <lc-cultivar>_chrN.$(EXT)
+#                    e.g.  nipponbare_chr1.fna  ir64_chr1.fna
+#
+# The FIRST cultivar in $(CULTIVARS) is the reference backbone.
+#
+# Usage:
+#   make -f Makefile.minigraph whole                       # 12-chromosome graph
+#   make -f Makefile.minigraph chr CHR=chr1                # one chromosome
+#   make -f Makefile.minigraph graph SCOPE=chr3            # equivalent, explicit
+#   make -f Makefile.minigraph allchr                      # all 12 as separate graphs
+#   make -f Makefile.minigraph whole INPUT_DIR=/path THREADS=32 \
+#        CULTIVARS="Nipponbare IR64 Azucena"
+#   make -f Makefile.minigraph help
+#
+# NOTE: a plain minigraph rGFA carries the reference path + bubbles but NOT
+# per-sample haplotype paths, so `vg deconstruct` on it only sees the reference.
+# That is expected for the standalone "minigraph" benchmark arm.
+# =============================================================================
+
+SHELL          := /bin/bash
+
+# ---- Configuration (override on the command line) --------------------------
+# Cased PanSN sample names; FIRST is the reference. Input files use the
+# lowercase form (IR64 -> ir64...). For a whole-genome run you typically drop
+# 'Simulated' (it only exists for the chr1 simulation).
+CULTIVARS      ?= Nipponbare IR64 Azucena Simulated
+REFERENCE      ?= $(firstword $(CULTIVARS))
+
+THREADS        ?= 32
+INPUT_DIR      ?= .
+OUT_DIR        ?= graphs
+EXT            ?= fna
+
+# whole | chrN  (CHR is used only by the 'chr' convenience target)
+SCOPE          ?= whole
+CHR            ?= chr1
+# Chromosomes for the 'allchr' helper (rice = 12).
+CHR_LIST       ?= chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8 chr9 chr10 chr11 chr12
+
+MINIGRAPH      ?= minigraph
+SAMTOOLS       ?= samtools
+# -c stable coords, -x ggs = graph-generation preset for same-species assemblies.
+MINIGRAPH_OPTS ?= -cxggs
+
+# ---- Derived values --------------------------------------------------------
+lc = $(shell printf '%s' '$(1)' | tr '[:upper:]' '[:lower:]')
+
+# Input filename suffix: empty for whole genome, _chrN for a single chromosome.
+ifeq ($(SCOPE),whole)
+INSUFFIX       :=
+else
+INSUFFIX       := _$(SCOPE)
+endif
+
+OTHERS         := $(filter-out $(REFERENCE),$(CULTIVARS))
+MINIGRAPH_ORDER:= $(REFERENCE) $(OTHERS)
+
+PANSN_DIR      := $(OUT_DIR)/pansn/$(SCOPE)
+RAW_FASTAS     := $(foreach c,$(CULTIVARS),$(INPUT_DIR)/$(call lc,$(c))$(INSUFFIX).$(EXT))
+PANSN_FASTAS   := $(foreach c,$(CULTIVARS),$(PANSN_DIR)/$(c)$(INSUFFIX).$(EXT))
+MINIGRAPH_GFA  := $(OUT_DIR)/minigraph/$(SCOPE).minigraph.gfa
+
+# ---- Targets ---------------------------------------------------------------
+.PHONY: graph whole chr allchr inputs help clean
+.DEFAULT_GOAL := help
+
+graph: $(MINIGRAPH_GFA)
+
+inputs: $(PANSN_FASTAS)
+
+# Convenience wrappers (recursive make so SCOPE-derived paths recompute).
+whole:
+	$(MAKE) -f $(firstword $(MAKEFILE_LIST)) graph SCOPE=whole
+
+chr:
+	$(MAKE) -f $(firstword $(MAKEFILE_LIST)) graph SCOPE=$(CHR)
+
+allchr:
+	@for c in $(CHR_LIST); do \
+	  echo "=== minigraph $$c ==="; \
+	  $(MAKE) -f $(firstword $(MAKEFILE_LIST)) graph SCOPE=$$c || exit 1; \
+	done
+
+# ----------------------------------------------------------------------------
+# Stage inputs: PanSN-normalise every contig header to "<Sample>#1#<contig>".
+# Idempotent — if a header is already PanSN (Sample#1#chr1) the contig is taken
+# as the last '#'-field, so re-running won't double-prefix. Works for both the
+# 12-contig whole-genome FASTAs and single-chromosome FASTAs.
+# $(call STAGE_INPUT,<CasedSample>)
+# ----------------------------------------------------------------------------
+define STAGE_INPUT
+$(PANSN_DIR)/$(1)$(INSUFFIX).$(EXT): $(INPUT_DIR)/$(call lc,$(1))$(INSUFFIX).$(EXT)
+	@mkdir -p $(PANSN_DIR)
+	@echo ">>> PanSN-normalising $$< -> $$@ (sample $(1))"
+	@awk -v s="$(1)" '/^>/{h=substr($$$$0,2); split(h,a," "); n=split(a[1],b,"#"); print ">" s "#1#" b[n]; next} {print}' $$< > $$@
+	@$(SAMTOOLS) faidx $$@
+endef
+$(foreach c,$(CULTIVARS),$(eval $(call STAGE_INPUT,$(c))))
+
+# ----------------------------------------------------------------------------
+# Build the minigraph graph (reference backbone first, then the rest).
+# ----------------------------------------------------------------------------
+$(MINIGRAPH_GFA): $(PANSN_FASTAS)
+	@mkdir -p $(dir $(MINIGRAPH_GFA))
+	@echo ">>> minigraph [$(SCOPE)]: ref=$(REFERENCE)  order=[$(MINIGRAPH_ORDER)]"
+	$(MINIGRAPH) $(MINIGRAPH_OPTS) -t $(THREADS) \
+	    $(foreach c,$(MINIGRAPH_ORDER),$(PANSN_DIR)/$(c)$(INSUFFIX).$(EXT)) \
+	    > $(MINIGRAPH_GFA)
+	@echo ">>> GFA: $(MINIGRAPH_GFA)  ($$(grep -c '^S' $(MINIGRAPH_GFA)) segments)"
+
+# ----------------------------------------------------------------------------
+help:
+	@echo "Build a minigraph graph for the whole genome or a single chromosome."
+	@echo ""
+	@echo "Targets:"
+	@echo "  whole              whole-genome graph (SCOPE=whole)"
+	@echo "  chr CHR=chrN       one-chromosome graph (e.g. CHR=chr1)"
+	@echo "  graph SCOPE=...    build for an explicit SCOPE (whole | chrN)"
+	@echo "  allchr             build all of CHR_LIST as separate graphs"
+	@echo "  inputs             just stage PanSN-normalised FASTAs"
+	@echo "  clean              remove $(OUT_DIR)"
+	@echo ""
+	@echo "Config (override as 'make -f Makefile.minigraph VAR=value target'):"
+	@echo "  SCOPE      = $(SCOPE)   (whole | chrN)"
+	@echo "  CULTIVARS  = $(CULTIVARS)"
+	@echo "  REFERENCE  = $(REFERENCE)"
+	@echo "  INPUT_DIR  = $(INPUT_DIR)"
+	@echo "  OUT_DIR    = $(OUT_DIR)"
+	@echo "  THREADS    = $(THREADS)"
+	@echo "  MINIGRAPH  = $(MINIGRAPH)  $(MINIGRAPH_OPTS)"
+	@echo "  Inputs expected for SCOPE=$(SCOPE): $(RAW_FASTAS)"
+	@echo "  Output GFA: $(MINIGRAPH_GFA)"
+
+clean:
+	rm -rf $(OUT_DIR)

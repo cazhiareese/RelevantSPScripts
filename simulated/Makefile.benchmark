@@ -1,0 +1,228 @@
+# =============================================================================
+# Makefile.benchmark — Truvari benchmarking of Swave SV callsets vs sv_truth.vcf.
+# =============================================================================
+#
+# Benchmarks ONE graph's Swave callset at a time against the simulated truth,
+# writing a clean self-contained log per run. Run them separately:
+#
+#     make -f Makefile.benchmark bench-pggb        # minigraph-cactus? no -> pggb
+#     make -f Makefile.benchmark bench-cactus      # = minigraph-cactus
+#     make -f Makefile.benchmark bench-minigraph
+#     make -f Makefile.benchmark bench             # all three in sequence
+#
+# Each run produces, under $(BENCH_DIR):
+#     <graph>.<METHOD>/              full truvari output dir (tp/fp/fn, summary.json)
+#     <graph>.<METHOD>.vcf.gz        the normalized callset that was scored
+#     <graph>.<METHOD>.stratified.tsv  size-bin x SV-type metrics
+#     <graph>.<METHOD>.log           <-- clean human-readable results log
+#
+# Callset source (Swave is produced externally):
+#     <graph>-swave/swave.sample_level.split.vcf.gz
+#
+# Truth, callset and reference all live in Nipponbare coordinates but carry
+# different contig labels; everything is renamed to $(BENCH_CHROM) so Truvari
+# can line them up.
+#
+# Shared configuration (paths, tool names) comes from config.mk.
+# =============================================================================
+
+include config.mk
+
+# ---- Benchmark configuration (override on the command line) -----------------
+TRUVARI        ?= truvari
+BCFTOOLS       ?= bcftools
+
+TRUTH_VCF      ?= sv_truth.vcf
+# Reference FASTA, e.g. nipponbare_chr1.fna (keep comment off the value line).
+REF_FASTA      ?= $(call lc,$(REFERENCE))_chr1.$(EXT)
+# Common contig name that truth, callsets and the reference are all renamed to.
+BENCH_CHROM    ?= chr1
+BENCH_DIR      ?= $(OUT_DIR)/truvari
+
+# Graphs you can benchmark (run one at a time). 'cactus' = minigraph-cactus.
+BENCH_GRAPHS   ?= cactus pggb minigraph
+# Decomposition method being benchmarked. Swave for now; vcfwave later.
+METHOD         ?= swave
+
+# (B) Which Swave output file to score. Swap to compare representations:
+#   swave.sample_level.split.vcf.gz   (default; decomposed, per-sample)
+#   swave.sample_level.vcf            (non-split)
+#   swave.hap_level.vcf               (per-haplotype — often cleanest for Simulated)
+SWAVE_FILE     ?= swave.sample_level.split.vcf.gz
+
+# (C) Set COLLAPSE=1 to merge redundant/overlapping calls with `truvari collapse`
+# before scoring (helps when one event is split into several records).
+COLLAPSE       ?=
+COLLAPSE_REFDIST ?= 1000
+
+# Restrict callsets to variants carried by the simulated sample BEFORE scoring,
+# so real IR64/Azucena SVs (NOT in the simulated truth) don't inflate false
+# positives. Set empty (SAMPLE=) to disable. The truth is never filtered.
+# Verify the name first:  bcftools query -l <callset>.vcf.gz
+SAMPLE         ?= Simulated
+
+# Truvari matching parameters.
+#  pctseq=0   : truth uses SYMBOLIC ALT alleles (<DEL>/<INS>/...), no ALT
+#               sequence to compare — match on size + position + type only.
+#  dup-to-ins : graph callers emit duplications as inserted sequence.
+#  (no --passonly: graph/Swave calls often have FILTER='.', which --passonly drops.)
+REFDIST        ?= 500
+PCTSIZE        ?= 0.7
+SIZEMIN        ?= 50
+SIZEMAX        ?= 125000
+# BND (translocation) breakpoint match distance — truvari matches breakends by
+# proximity, not size. Widen if caller breakpoints are imprecise.
+BNDDIST        ?= 500
+TRUVARI_OPTS   ?= --pctseq 0 --pctsize $(PCTSIZE) --refdist $(REFDIST) \
+                  --sizemin $(SIZEMIN) --sizemax $(SIZEMAX) --dup-to-ins --bnddist $(BNDDIST)
+
+# Stratification helper (sibling simulation/ dir of the repo).
+STRATIFY       ?= python3 ../simulation/stratify_truvari.py
+
+# ---- Derived ----------------------------------------------------------------
+REF_NORM       := $(BENCH_DIR)/ref.fa
+TRUTH_NORM     := $(BENCH_DIR)/truth.vcf.gz
+
+# Source callset path for a graph. swave -> external <graph>-swave/...,
+# any other method -> $(VCF_DIR)/<graph>.<method>.vcf.gz   $(call CALLSET,<graph>)
+CALLSET = $(if $(filter swave,$(METHOD)),$(1)-swave/$(SWAVE_FILE),$(if $(filter vcfwave,$(METHOD)),$(1)-vcfwave/$(1).vcfwave.vcf.gz,$(VCF_DIR)/$(1).$(METHOD).vcf.gz))
+
+# Optional per-sample filter applied to callsets only (see SAMPLE above).
+ifeq ($(strip $(SAMPLE)),)
+SAMPLE_PIPE := cat
+else
+SAMPLE_PIPE := $(BCFTOOLS) view -s $(SAMPLE) --min-ac 1 -Ov -
+endif
+
+.PHONY: bench summary stratify help clean
+.DEFAULT_GOAL := help
+
+# ---- Reference FASTA: reheader its single contig to $(BENCH_CHROM) ----------
+$(REF_NORM): $(REF_FASTA)
+	@mkdir -p $(BENCH_DIR)
+	sed '1s/^>.*/>$(BENCH_CHROM)/' $(REF_FASTA) > $@
+	$(SAMTOOLS) faidx $@
+
+# ---- Truth VCF: rename contig -> $(BENCH_CHROM), sort, bgzip, index ----------
+$(TRUTH_NORM): $(TRUTH_VCF)
+	@mkdir -p $(BENCH_DIR)
+	zcat -f $(TRUTH_VCF) \
+	  | awk 'BEGIN{FS=OFS="\t"} /^##contig=<ID=/{sub(/ID=[^,>]+/,"ID=$(BENCH_CHROM)")} /^#/{print;next} {$$1="$(BENCH_CHROM)";print}' \
+	  | $(BCFTOOLS) sort -Oz -o $@ -
+	$(TABIX) -f -p vcf $@
+
+# ----------------------------------------------------------------------------
+# Per-graph benchmark (pattern rule; run one graph at a time).
+#   make -f Makefile.benchmark bench-<graph>
+# Normalizes the callset (rename contig, optional sample filter), runs truvari,
+# then writes a clean log with summary.json + the stratified table.
+# ----------------------------------------------------------------------------
+bench-%: $(TRUTH_NORM) $(REF_NORM)
+	@mkdir -p $(BENCH_DIR)
+	@set -e; \
+	 src="$(call CALLSET,$*)"; out="$(BENCH_DIR)/$*.$(METHOD)"; norm="$$out.vcf.gz"; log="$$out.log"; \
+	 if [ ! -s "$$src" ]; then echo "ERROR: callset not found for '$*': $$src" >&2; \
+	   echo "       (Swave output expected at <graph>-swave/swave.sample_level.split.vcf.gz)" >&2; exit 1; fi; \
+	 echo ">>> [$*] normalizing $$src (sample=$(SAMPLE))"; \
+	 zcat -f "$$src" \
+	   | awk 'BEGIN{FS=OFS="\t"} /^##contig=<ID=/{sub(/ID=[^,>]+/,"ID=$(BENCH_CHROM)")} /^#/{print;next} {$$1="$(BENCH_CHROM)";print}' \
+	   | $(BCFTOOLS) norm -m -any -Ou - \
+	   | $(SAMPLE_PIPE) \
+	   | $(BCFTOOLS) sort -Oz -o "$$norm" -; \
+	 $(TABIX) -f -p vcf "$$norm"; \
+	 cmp="$$norm"; \
+	 if [ -n "$(COLLAPSE)" ]; then \
+	   echo ">>> [$*] truvari collapse (refdist=$(COLLAPSE_REFDIST)) — merging redundant calls"; \
+	   $(TRUVARI) collapse -i "$$norm" -o "$$out.collapsed.raw.vcf" -c "$$out.removed.vcf" \
+	       -k maxqual --refdist $(COLLAPSE_REFDIST); \
+	   $(BCFTOOLS) sort -Oz -o "$$out.collapsed.vcf.gz" "$$out.collapsed.raw.vcf"; \
+	   $(TABIX) -f -p vcf "$$out.collapsed.vcf.gz"; \
+	   rm -f "$$out.collapsed.raw.vcf"; \
+	   cmp="$$out.collapsed.vcf.gz"; \
+	 fi; \
+	 echo ">>> [$*] truvari bench"; \
+	 rm -rf "$$out"; \
+	 $(TRUVARI) bench -b $(TRUTH_NORM) -c "$$cmp" -f $(REF_NORM) -o "$$out" $(TRUVARI_OPTS); \
+	 $(STRATIFY) --bench-dir "$$out" --out "$$out.stratified.tsv" >/dev/null 2>&1 || true; \
+	 { \
+	   echo "==================================================================="; \
+	   echo " Truvari benchmark :  $*  x  $(METHOD)"; \
+	   echo " date              :  $$(date '+%F %T')"; \
+	   echo " truth             :  $(TRUTH_VCF)"; \
+	   echo " callset (source)  :  $$src"; \
+	   echo " sample filter     :  $(SAMPLE)"; \
+	   echo " collapse          :  $(if $(COLLAPSE),yes (refdist=$(COLLAPSE_REFDIST)),no)"; \
+	   echo " truvari opts      :  $(TRUVARI_OPTS)"; \
+	   echo "==================================================================="; \
+	   echo; echo "-- Overall (truvari summary.json) --"; \
+	   cat "$$out/summary.json" 2>/dev/null; echo; \
+	   echo "-- Stratified (size-bin x SV-type) --"; \
+	   column -t "$$out.stratified.tsv" 2>/dev/null || echo "(stratified table unavailable)"; \
+	 } | tee "$$log"; \
+	 echo ">>> log written: $$log"
+
+bench: $(foreach g,$(BENCH_GRAPHS),bench-$(g))
+
+# ----------------------------------------------------------------------------
+# (C) SVLEN histogram of a graph's callset — SVTYPE x size-bin, for the sample.
+#   make -f Makefile.benchmark svlen-pggb
+# Shows whether large SVs (esp. DEL) are being fragmented into <50bp pieces.
+# ----------------------------------------------------------------------------
+svlen-%:
+	@src="$(call CALLSET,$*)"; \
+	 if [ ! -s "$$src" ]; then echo "ERROR: callset not found: $$src" >&2; exit 1; fi; \
+	 echo "SVLEN histogram for $$src"; \
+	 echo "  (sample=$(SAMPLE); columns = count  SVTYPE  size-bin)"; \
+	 $(BCFTOOLS) view $(if $(strip $(SAMPLE)),-s $(SAMPLE) --min-ac 1,) "$$src" 2>/dev/null \
+	   | $(BCFTOOLS) query -f '%INFO/SVTYPE\t%INFO/SVLEN\n' 2>/dev/null \
+	   | awk -F'\t' '{n=($$2<0?-$$2:$$2)+0; \
+	        b=(n<50?"<50bp":n<500?"A_50-500":n<5000?"B_500-5k":n<50000?"C_5-50k":"D_>=50k"); \
+	        print $$1, b}' \
+	   | sort | uniq -c | sort -rn
+
+# Print the headline precision/recall/F1 from every run's summary.json.
+summary:
+	@for g in $(BENCH_GRAPHS); do \
+	  s=$(BENCH_DIR)/$$g.$(METHOD)/summary.json; \
+	  if [ -f "$$s" ]; then \
+	    printf '%-14s ' "$$g.$(METHOD)"; \
+	    python3 -c "import json;d=json.load(open('$$s'));print('precision=%.4f recall=%.4f f1=%.4f'%(d['precision'],d['recall'],d['f1']))"; \
+	  else echo "$$g.$(METHOD): not benchmarked yet"; fi; \
+	done
+
+help:
+	@echo "Benchmark Swave SV callsets vs sv_truth.vcf — one graph at a time."
+	@echo ""
+	@echo "Run separately:"
+	@echo "  make -f Makefile.benchmark bench-pggb"
+	@echo "  make -f Makefile.benchmark bench-cactus       # = minigraph-cactus"
+	@echo "  make -f Makefile.benchmark bench-minigraph"
+	@echo "  make -f Makefile.benchmark bench              # all of BENCH_GRAPHS"
+	@echo "  make -f Makefile.benchmark summary            # headline numbers per run"
+	@echo "  make -f Makefile.benchmark svlen-pggb         # SVLEN histogram (diagnose fragmentation)"
+	@echo ""
+	@echo "Improve the Swave arm:"
+	@echo "  (B) try another Swave output file:"
+	@echo "      make ... bench-pggb SWAVE_FILE=swave.hap_level.vcf"
+	@echo "  (C) merge fragmented calls before scoring:"
+	@echo "      make ... bench-pggb COLLAPSE=1"
+	@echo "  type-agnostic matching (Swave compound types):"
+	@echo "      make ... bench-pggb TRUVARI_OPTS=\"\$$(TRUVARI_OPTS) --typeignore\""
+	@echo ""
+	@echo "Each run writes a clean log:  $(BENCH_DIR)/<graph>.$(METHOD).log"
+	@echo ""
+	@echo "Config (override as 'make -f Makefile.benchmark VAR=value target'):"
+	@echo "  BENCH_GRAPHS = $(BENCH_GRAPHS)"
+	@echo "  METHOD       = $(METHOD)"
+	@echo "  SWAVE_FILE   = $(SWAVE_FILE)"
+	@echo "  COLLAPSE     = $(COLLAPSE)   (set =1 to enable; refdist=$(COLLAPSE_REFDIST))"
+	@echo "  SAMPLE       = $(SAMPLE)   (callsets filtered to this sample; empty=off)"
+	@echo "  TRUTH_VCF    = $(TRUTH_VCF)"
+	@echo "  REF_FASTA    = $(REF_FASTA)"
+	@echo "  BENCH_CHROM  = $(BENCH_CHROM)"
+	@echo "  BENCH_DIR    = $(BENCH_DIR)"
+	@echo "  TRUVARI      = $(TRUVARI)"
+	@echo "  TRUVARI_OPTS = $(TRUVARI_OPTS)"
+
+clean:
+	rm -rf $(BENCH_DIR)

@@ -1,0 +1,127 @@
+# =============================================================================
+# Makefile.deconstruct — Derive SV-VCF callsets for the SIMULATED chr1 benchmark.
+# =============================================================================
+#
+# Scope: the chr1 simulation only (the graphs built in this directory from
+# config.mk, with the Simulated haplotype included). Variants are decomposed
+# against the Nipponbare reference path (REF_PATH), in whose coordinates the
+# sv_truth.vcf is defined, so the callsets are directly Truvari-comparable.
+#
+# Applied ONLY to the minigraph-cactus and pggb graphs. The plain minigraph
+# rGFA is intentionally excluded: it carries the reference path and bubbles but
+# NOT per-sample haplotype paths, so `vg deconstruct` would only see Nipponbare
+# (genotyping the other samples would need a separate `minigraph --call` step).
+# pggb and minigraph-cactus embed per-haplotype paths and deconstruct directly.
+#
+# Each graph is decomposed into an SV-VCF by TWO methods, head-to-head:
+#   A) vg-vcfbub-vcfwave : vg deconstruct | vcfbub | vcfwave  -> *.vcfwave.vcf.gz
+#   B) Swave             : vg deconstruct | swave             -> *.swave.vcf.gz
+# Both branch from the SAME `vg deconstruct` output, so the only difference is
+# the decomposition step — an apples-to-apples comparison per graph.
+#
+# Run AFTER building graphs:
+#     make cactus pggb                  # (main Makefile) build the two graphs
+#     make -f Makefile.deconstruct callsets
+#
+# Useful targets:
+#     make -f Makefile.deconstruct callsets          # both methods x cactus,pggb
+#     make -f Makefile.deconstruct deconstruct       # just vg deconstruct
+#     make -f Makefile.deconstruct vcfwave           # method A
+#     make -f Makefile.deconstruct swave             # method B
+#     make -f Makefile.deconstruct vcfwave-pggb      # one graph, one method
+#     make -f Makefile.deconstruct help
+#
+# Shared configuration (cultivars, paths, tool names, params) is in config.mk.
+# =============================================================================
+
+include config.mk
+
+# Graphs to deconstruct here — minigraph-cactus and pggb only (NOT plain
+# minigraph). This deliberately overrides config.mk's $(GRAPHS); the main
+# Makefile still builds all three graphs.
+DECON_GRAPHS   := cactus pggb
+
+.PHONY: deconstruct vcfwave callsets help clean
+
+# This makefile produces only the vg-vcfbub-vcfwave callsets; Swave is external.
+callsets: vcfwave
+
+# Default goal is help so a bare `make -f Makefile.deconstruct` is harmless.
+.DEFAULT_GOAL := help
+
+# ----------------------------------------------------------------------------
+# Stage a plaintext .gfa per graph for vg deconstruct (cactus & pggb only).
+# These depend on the graph artifacts the main Makefile writes; if a graph is
+# missing the recipe errors with a hint to build it first.
+# ----------------------------------------------------------------------------
+$(VCF_DIR)/cactus.gfa: $(CACTUS_GFA)
+	@mkdir -p $(VCF_DIR)
+	zcat $(CACTUS_GFA) > $@
+
+$(VCF_DIR)/pggb.gfa: $(PGGB_STAMP)
+	@mkdir -p $(VCF_DIR)
+	@gfa=$$(ls $(PGGB_DIR)/*.smooth.final.gfa 2>/dev/null | head -1); \
+	  if [ -z "$$gfa" ]; then echo "ERROR: no *.smooth.final.gfa in $(PGGB_DIR) — run 'make pggb' first"; exit 1; fi; \
+	  echo ">>> pggb GFA: $$gfa"; ln -sf $$(realpath $$gfa) $@
+
+# Give a clear message if a required graph artifact is absent.
+$(CACTUS_GFA):
+	@echo "ERROR: $(CACTUS_GFA) not found — run 'make cactus' first." >&2; exit 1
+$(PGGB_STAMP):
+	@echo "ERROR: pggb output not found — run 'make pggb' first." >&2; exit 1
+
+# ----------------------------------------------------------------------------
+# Per-graph rule template: vg deconstruct, then the vcfwave decomposition.
+# (The Swave method is run with the external `swave` tool — it produces its own
+#  <graph>-swave/swave.sample_level.split.vcf.gz, consumed directly by
+#  Makefile.benchmark — so it is NOT a target here.)
+# $(call VGVCF,<graph-name>)
+# ----------------------------------------------------------------------------
+define VGVCF
+deconstruct-$(1): $(VCF_DIR)/$(1).deconstruct.vcf.gz
+$(VCF_DIR)/$(1).deconstruct.vcf.gz: $(VCF_DIR)/$(1).gfa
+	@echo ">>> [$(1)] vg deconstruct against reference prefix $(REF_PREFIX)"
+	$(VG) deconstruct -P '$(REF_PREFIX)' -e -a -t $(THREADS) $$< \
+	    | $(BGZIP) -@ $(THREADS) > $$@
+	$(TABIX) -p vcf $$@
+
+vcfwave-$(1): $(VCF_DIR)/$(1).vcfwave.vcf.gz
+$(VCF_DIR)/$(1).vcfwave.vcf.gz: $(VCF_DIR)/$(1).deconstruct.vcf.gz
+	@echo ">>> [$(1)] vg-vcfbub-vcfwave: vcfbub | vcfwave"
+	$(VCFBUB) -l 0 -a $(VCFBUB_MAX) --input $$< \
+	    | $(VCFWAVE) -I $(VCFWAVE_I) -t $(THREADS) \
+	    | $(BGZIP) -@ $(THREADS) > $$@
+	$(TABIX) -p vcf $$@
+endef
+$(foreach g,$(DECON_GRAPHS),$(eval $(call VGVCF,$(g))))
+
+# Aggregate convenience targets (cactus & pggb) ------------------------------
+deconstruct: $(foreach g,$(DECON_GRAPHS),deconstruct-$(g))
+vcfwave:      $(foreach g,$(DECON_GRAPHS),vcfwave-$(g))
+
+# ----------------------------------------------------------------------------
+# Housekeeping
+# ----------------------------------------------------------------------------
+help:
+	@echo "Decompose the simulated chr1 graphs (cactus & pggb) into vcfwave callsets."
+	@echo "Run after 'make cactus pggb'. (Swave is run separately with its own tool;"
+	@echo " its output in <graph>-swave/ is consumed directly by Makefile.benchmark.)"
+	@echo ""
+	@echo "Targets:"
+	@echo "  callsets     vg-vcfbub-vcfwave for cactus & pggb  -> *.vcfwave.vcf.gz"
+	@echo "  deconstruct  vg deconstruct only                  -> *.deconstruct.vcf.gz"
+	@echo "  vcfwave      vcfbub|vcfwave                        -> *.vcfwave.vcf.gz"
+	@echo "  per-graph:   deconstruct-pggb, vcfwave-cactus, ..."
+	@echo "  clean        remove $(VCF_DIR)"
+	@echo ""
+	@echo "Config (from config.mk; override as 'make -f Makefile.deconstruct VAR=value target'):"
+	@echo "  DECON_GRAPHS = $(DECON_GRAPHS)   (minigraph excluded: no per-sample paths)"
+	@echo "  REF_PREFIX = $(REF_PREFIX)   (matches Nipponbare#0#chr1 cactus & Nipponbare#1#chr1 pggb)"
+	@echo "  THREADS    = $(THREADS)"
+	@echo "  OUT_DIR    = $(OUT_DIR)   (VCFs in $(VCF_DIR))"
+	@echo "  VG / VCFBUB / VCFWAVE = $(VG) / $(VCFBUB) / $(VCFWAVE)"
+	@echo "  VCFBUB_MAX = $(VCFBUB_MAX)   VCFWAVE_I = $(VCFWAVE_I)"
+
+# Only remove the VCF outputs; leave the graphs intact.
+clean:
+	rm -rf $(VCF_DIR)

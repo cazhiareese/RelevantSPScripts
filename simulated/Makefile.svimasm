@@ -1,0 +1,203 @@
+# =============================================================================
+# Makefile.svimasm — SVIM-asm single-reference SV pipeline, end to end.
+#   install -> minimap2 pairwise alignment -> svim-asm call -> Truvari benchmark
+# =============================================================================
+#
+# Calls SVs of the simulated assembly against the Nipponbare reference, then
+# benchmarks them against sv_truth.vcf. Because this is a PAIRWISE alignment
+# (simulated vs Nipponbare only), every call is comparable to the truth — there
+# is no IR64/Azucena contamination, so no per-sample filtering is needed.
+#
+# Quick start:
+#     make -f Makefile.svimasm install            # one-time: build the conda env
+#     conda activate svimasm                       # tools must be on PATH
+#     make -f Makefile.svimasm all                 # align -> call -> benchmark
+#
+# Or step by step:
+#     make -f Makefile.svimasm align               # minimap2 -> sorted, indexed BAM
+#     make -f Makefile.svimasm call                # svim-asm haploid -> variants.vcf
+#     make -f Makefile.svimasm bench               # truvari -> svimasm.log
+#     make -f Makefile.svimasm summary
+#
+# If you prefer not to activate the env, prefix tools, e.g.:
+#     make -f Makefile.svimasm all RUN="conda run -n svimasm"
+# =============================================================================
+
+SHELL          := /bin/bash
+.SHELLFLAGS    := -o pipefail -c
+.DELETE_ON_ERROR:
+
+# ---- Configuration (override on the command line) ---------------------------
+ENV            ?= svimasm
+THREADS        ?= 16
+
+# Inputs (in this directory by default). Keep comments OFF the value lines —
+# Make folds spaces before a trailing '#' into the variable value.
+# REF: reference the SVs are called against.
+REF            ?= nipponbare_chr1.fna
+# QUERY: the simulated haploid assembly.
+QUERY          ?= simulated_chr1.fna
+TRUTH_VCF      ?= sv_truth.vcf
+
+OUTDIR         ?= svimasm_out
+# BENCH_CHROM: common contig name for truth/calls/ref.
+BENCH_CHROM    ?= chr1
+
+# Tool commands. With `conda activate svimasm` these bare names work; otherwise
+# set RUN="conda run -n svimasm" to run them all inside the env.
+RUN            ?=
+MINIMAP2       ?= $(RUN) minimap2
+SAMTOOLS       ?= $(RUN) samtools
+SVIM_ASM       ?= $(RUN) svim-asm
+BCFTOOLS       ?= $(RUN) bcftools
+TABIX          ?= $(RUN) tabix
+TRUVARI        ?= $(RUN) truvari
+
+# minimap2 assembly-to-reference preset (asm5 ~ <5% divergence; use asm10/asm20
+# for more divergent assemblies).
+MM2_PRESET     ?= asm5
+
+# svim-asm duplication reporting. By default svim-asm emits tandem/interspersed
+# duplications as their OWN types (DUP:TANDEM / DUP:INT). These flags make it
+# emit them as INS instead — which is how callers usually represent a tandem dup,
+# and it lines up with the benchmark's `--dup-to-ins` (truth <DUP> -> INS). That
+# is why the resulting VCF "has no DUPs": they are reported as insertions and
+# still score correctly as DUP recall on the truth side.
+# Set SVIM_OPTS= (empty) to keep native DUP:TANDEM / DUP:INT records instead.
+SVIM_OPTS      ?= --tandem_duplications_as_insertions --interspersed_duplications_as_insertions
+
+# Truvari matching (truth uses symbolic ALT -> pctseq 0; dup-to-ins for <DUP>).
+TRUVARI_OPTS   ?= --pctseq 0 --pctsize 0.7 --refdist 500 \
+                  --sizemin 50 --sizemax 125000 --dup-to-ins
+
+STRATIFY       ?= python3 ../simulation/stratify_truvari.py
+
+# ---- Derived ----------------------------------------------------------------
+BAM            := $(OUTDIR)/simulated.to.ref.sorted.bam
+SVIM_VCF       := $(OUTDIR)/variants.vcf
+BENCH_DIR      := $(OUTDIR)/truvari
+REF_NORM       := $(BENCH_DIR)/ref.fa
+TRUTH_NORM     := $(BENCH_DIR)/truth.vcf.gz
+CALL_NORM      := $(BENCH_DIR)/svimasm.vcf.gz
+RUN_DIR        := $(BENCH_DIR)/svimasm
+
+.PHONY: install align call bench summary all help clean
+.DEFAULT_GOAL := help
+
+all: bench
+
+# ----------------------------------------------------------------------------
+# 0) Install — one conda env with everything (svim-asm, minimap2, samtools,
+#    bcftools/htslib, truvari).
+# ----------------------------------------------------------------------------
+install:
+	conda create -y -n $(ENV) -c bioconda -c conda-forge \
+	    svim-asm minimap2 samtools bcftools htslib "truvari>=4.0"
+	@echo ">>> created env '$(ENV)'. Activate it:  conda activate $(ENV)"
+
+# ----------------------------------------------------------------------------
+# 1) Pairwise alignment — minimap2 assembly preset -> sorted, indexed BAM.
+# ----------------------------------------------------------------------------
+align: $(BAM)
+
+$(BAM): $(REF) $(QUERY)
+	@mkdir -p $(OUTDIR)
+	@echo ">>> minimap2 -x $(MM2_PRESET): $(QUERY) -> $(REF)"
+	$(SAMTOOLS) faidx $(REF)
+	$(MINIMAP2) -a -x $(MM2_PRESET) --cs -r2k -t $(THREADS) $(REF) $(QUERY) \
+	  | $(SAMTOOLS) sort -@ $(THREADS) -o $(BAM) -
+	$(SAMTOOLS) index $(BAM)
+
+# ----------------------------------------------------------------------------
+# 2) Call — svim-asm haploid (single assembly vs reference) -> variants.vcf.
+# ----------------------------------------------------------------------------
+call: $(SVIM_VCF)
+
+$(SVIM_VCF): $(BAM) $(REF)
+	@mkdir -p $(OUTDIR)
+	@echo ">>> svim-asm haploid $(SVIM_OPTS)"
+	$(SAMTOOLS) faidx $(REF)
+	$(SVIM_ASM) haploid $(SVIM_OPTS) $(OUTDIR) $(BAM) $(REF)
+	@test -s $(SVIM_VCF) && echo ">>> SVIM-asm VCF: $(SVIM_VCF)"
+
+# ----------------------------------------------------------------------------
+# Benchmark normalization helpers: rename single contig -> $(BENCH_CHROM),
+# sort, bgzip, index. No sample filter (pairwise alignment = one sample).
+# ----------------------------------------------------------------------------
+$(REF_NORM): $(REF)
+	@mkdir -p $(BENCH_DIR)
+	sed '1s/^>.*/>$(BENCH_CHROM)/' $(REF) > $@
+	$(SAMTOOLS) faidx $@
+
+$(TRUTH_NORM): $(TRUTH_VCF)
+	@mkdir -p $(BENCH_DIR)
+	zcat -f $(TRUTH_VCF) \
+	  | awk 'BEGIN{FS=OFS="\t"} /^##contig=<ID=/{sub(/ID=[^,>]+/,"ID=$(BENCH_CHROM)")} /^#/{print;next} {$$1="$(BENCH_CHROM)";print}' \
+	  | $(BCFTOOLS) sort -Oz -o $@ -
+	$(TABIX) -f -p vcf $@
+
+$(CALL_NORM): $(SVIM_VCF)
+	@mkdir -p $(BENCH_DIR)
+	zcat -f $(SVIM_VCF) \
+	  | awk 'BEGIN{FS=OFS="\t"} /^##contig=<ID=/{sub(/ID=[^,>]+/,"ID=$(BENCH_CHROM)")} /^#/{print;next} {$$1="$(BENCH_CHROM)";print}' \
+	  | $(BCFTOOLS) sort -Oz -o $@ -
+	$(TABIX) -f -p vcf $@
+
+# ----------------------------------------------------------------------------
+# 3) Benchmark — truvari bench + stratified table, written to a clean log.
+# ----------------------------------------------------------------------------
+bench: $(CALL_NORM) $(TRUTH_NORM) $(REF_NORM)
+	@set -e; \
+	 echo ">>> truvari bench [svim-asm]"; \
+	 rm -rf $(RUN_DIR); \
+	 $(TRUVARI) bench -b $(TRUTH_NORM) -c $(CALL_NORM) -f $(REF_NORM) \
+	     -o $(RUN_DIR) $(TRUVARI_OPTS); \
+	 $(STRATIFY) --bench-dir $(RUN_DIR) --out $(RUN_DIR).stratified.tsv >/dev/null 2>&1 || true; \
+	 { \
+	   echo "==================================================================="; \
+	   echo " SVIM-asm benchmark"; \
+	   echo " date            : $$(date '+%F %T')"; \
+	   echo " reference       : $(REF)"; \
+	   echo " query assembly  : $(QUERY)   (minimap2 -x $(MM2_PRESET))"; \
+	   echo " truth           : $(TRUTH_VCF)"; \
+	   echo " truvari opts    : $(TRUVARI_OPTS)"; \
+	   echo "==================================================================="; \
+	   echo; echo "-- Overall (truvari summary.json) --"; \
+	   cat $(RUN_DIR)/summary.json 2>/dev/null; echo; \
+	   echo "-- Stratified (size-bin x SV-type) --"; \
+	   column -t $(RUN_DIR).stratified.tsv 2>/dev/null || echo "(stratified table unavailable)"; \
+	 } | tee $(OUTDIR)/svimasm.log; \
+	 echo ">>> log written: $(OUTDIR)/svimasm.log"
+
+summary:
+	@s=$(RUN_DIR)/summary.json; \
+	 if [ -f "$$s" ]; then \
+	   printf 'svim-asm  '; \
+	   python3 -c "import json;d=json.load(open('$$s'));print('precision=%.4f recall=%.4f f1=%.4f'%(d['precision'],d['recall'],d['f1']))"; \
+	 else echo "not benchmarked yet — run 'make -f Makefile.svimasm bench'"; fi
+
+help:
+	@echo "SVIM-asm pipeline: install -> align -> call -> benchmark."
+	@echo ""
+	@echo "Targets:"
+	@echo "  install   build conda env '$(ENV)' (svim-asm, minimap2, samtools, bcftools, truvari)"
+	@echo "  align     minimap2 -x $(MM2_PRESET) -> $(BAM)"
+	@echo "  call      svim-asm haploid          -> $(SVIM_VCF)"
+	@echo "  bench     truvari vs truth          -> $(OUTDIR)/svimasm.log"
+	@echo "  summary   headline precision/recall/f1"
+	@echo "  all       = bench (runs align + call as prerequisites)"
+	@echo "  clean     remove $(OUTDIR)"
+	@echo ""
+	@echo "Config (override as 'make -f Makefile.svimasm VAR=value target'):"
+	@echo "  ENV=$(ENV)  THREADS=$(THREADS)  MM2_PRESET=$(MM2_PRESET)"
+	@echo "  REF=$(REF)"
+	@echo "  QUERY=$(QUERY)"
+	@echo "  TRUTH_VCF=$(TRUTH_VCF)"
+	@echo "  OUTDIR=$(OUTDIR)   BENCH_CHROM=$(BENCH_CHROM)"
+	@echo "  RUN='$(RUN)'   (set to 'conda run -n $(ENV)' to skip activating)"
+	@echo "  SVIM_OPTS=$(SVIM_OPTS)"
+	@echo "             (default: dups reported as INS; set SVIM_OPTS= for native DUP:TANDEM/DUP:INT)"
+	@echo "  TRUVARI_OPTS=$(TRUVARI_OPTS)"
+
+clean:
+	rm -rf $(OUTDIR)

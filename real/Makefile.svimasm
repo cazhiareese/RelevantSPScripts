@@ -1,0 +1,194 @@
+# =============================================================================
+# Makefile.svimasm (REAL arm) — SVIM-asm single-reference SV pipeline, per
+# accession: Nipponbare vs IR64  AND  Nipponbare vs Azucena.
+#   install -> minimap2 pairwise alignment -> svim-asm call -> Truvari benchmark
+# =============================================================================
+#
+# For each accession it aligns <acc>_chr1.fna to nipponbare_chr1.fna, calls SVs
+# with svim-asm, and benchmarks against that accession's dotplot-validated
+# SILVER truth (bio_align/ground_truth/<acc>_ground_truth.vcf).
+#
+# SILVER truth caveat: only validated SVs are in the truth, so a call absent from
+# it may be a real SV you didn't validate, NOT a false positive.
+#   => RECALL is the trustworthy metric; precision is a LOWER BOUND.
+#
+# Quick start:
+#     make -f Makefile.svimasm install && conda activate svimasm
+#     make -f Makefile.svimasm all                 # both accessions, end to end
+#
+# Per accession / step:
+#     make -f Makefile.svimasm bench-IR64          # align+call+bench for IR64
+#     make -f Makefile.svimasm align-Azucena
+#     make -f Makefile.svimasm summary
+# =============================================================================
+
+SHELL          := /bin/bash
+.SHELLFLAGS    := -o pipefail -c
+.DELETE_ON_ERROR:
+
+# ---- Configuration (override on the command line) ---------------------------
+ENV            ?= svimasm
+THREADS        ?= 16
+
+ACCESSIONS     ?= IR64 Azucena
+# Assemblies are the PanSN-named (CASED) FASTAs staged by the graph build, e.g.
+# graphs/pansn/IR64_chr1.fna, graphs/pansn/Nipponbare_chr1.fna.
+PANSN_DIR      ?= graphs/pansn
+EXT            ?= fna
+# Reference sample + its assembly (queries are $(PANSN_DIR)/<Accession>_chr1.$(EXT)).
+REF_SAMPLE     ?= Nipponbare
+REF            ?= $(PANSN_DIR)/$(REF_SAMPLE)_chr1.$(EXT)
+# Per-accession silver truth: $(TRUTH_DIR)/<lc-acc>_ground_truth.vcf
+TRUTH_DIR      ?= ../bio_align/ground_truth
+
+OUTDIR         ?= svimasm_out
+# Common contig name that truth / calls / ref are all renamed to.
+BENCH_CHROM    ?= chr1
+
+# Tool commands (bare with `conda activate svimasm`; else RUN="conda run -n svimasm").
+RUN            ?=
+MINIMAP2       ?= $(RUN) minimap2
+SAMTOOLS       ?= $(RUN) samtools
+SVIM_ASM       ?= $(RUN) svim-asm
+BCFTOOLS       ?= $(RUN) bcftools
+TABIX          ?= $(RUN) tabix
+TRUVARI        ?= $(RUN) truvari
+
+MM2_PRESET     ?= asm5
+# svim-asm: report tandem/interspersed dups as INS (matches truth <DUP> via --dup-to-ins).
+SVIM_OPTS      ?= --tandem_duplications_as_insertions --interspersed_duplications_as_insertions
+
+# Truvari — same lenient config as the real-arm pangenome benchmark, so the
+# comparison is apples-to-apples. --bnddist matches translocation (BND) breakends.
+TRUVARI_OPTS   ?= --pctseq 0 --pctsize 0.5 --refdist 1000 --sizemin 50 \
+                  --sizemax 125000 --dup-to-ins --typeignore --bnddist 500
+
+STRATIFY       ?= python3 ../simulation/stratify_truvari.py
+
+# ---- Derived ----------------------------------------------------------------
+lc = $(shell printf '%s' '$(1)' | tr '[:upper:]' '[:lower:]')
+REF_NORM       := $(OUTDIR)/ref.fa
+
+.PHONY: install all align call vcf summary help clean \
+        $(foreach a,$(ACCESSIONS),align-$(a) call-$(a) bench-$(a))
+.DEFAULT_GOAL := help
+
+all: $(foreach a,$(ACCESSIONS),bench-$(a))
+
+# Just produce the SVIM-asm VCFs for every accession — STOP before benchmarking.
+align: $(foreach a,$(ACCESSIONS),align-$(a))
+call vcf: $(foreach a,$(ACCESSIONS),call-$(a))
+	@echo ">>> VCFs ready: $(foreach a,$(ACCESSIONS),$(OUTDIR)/$(a)/variants.vcf)"
+	@echo ">>> to benchmark later:  make -f Makefile.svimasm all   (or bench-<ACC>)"
+
+# ----------------------------------------------------------------------------
+# Install
+# ----------------------------------------------------------------------------
+install:
+	conda create -y -n $(ENV) -c bioconda -c conda-forge \
+	    svim-asm minimap2 samtools bcftools htslib "truvari>=4.0"
+	@echo ">>> created env '$(ENV)'. Activate:  conda activate $(ENV)"
+
+# Reference reheadered to $(BENCH_CHROM) (shared by both accessions).
+$(REF_NORM): $(REF)
+	@mkdir -p $(OUTDIR)
+	sed '1s/^>.*/>$(BENCH_CHROM)/' $(REF) > $@
+	$(SAMTOOLS) faidx $@
+
+# ----------------------------------------------------------------------------
+# File pattern rules (real files, % = accession — these DO work as patterns).
+#   1) Align — minimap2 <acc>_chr1.fna -> Nipponbare -> sorted, indexed BAM
+#   2) Call  — svim-asm haploid -> variants.vcf
+# ----------------------------------------------------------------------------
+$(OUTDIR)/%/aln.sorted.bam: $(REF)
+	@mkdir -p $(dir $@)
+	@q="$(PANSN_DIR)/$*_chr1.$(EXT)"; \
+	 [ -s "$$q" ] || { echo "ERROR: query assembly $$q not found" >&2; exit 1; }; \
+	 echo ">>> [$*] minimap2 -x $(MM2_PRESET): $$q -> $(REF)"; \
+	 $(SAMTOOLS) faidx $(REF); \
+	 $(MINIMAP2) -a -x $(MM2_PRESET) --cs -r2k -t $(THREADS) $(REF) "$$q" \
+	   | $(SAMTOOLS) sort -@ $(THREADS) -o $@ -; \
+	 $(SAMTOOLS) index $@
+
+$(OUTDIR)/%/variants.vcf: $(OUTDIR)/%/aln.sorted.bam $(REF)
+	@mkdir -p $(dir $@)
+	@echo ">>> [$*] svim-asm haploid $(SVIM_OPTS)"
+	$(SAMTOOLS) faidx $(REF)
+	$(SVIM_ASM) haploid $(SVIM_OPTS) $(OUTDIR)/$* $< $(REF)
+	@test -s $@ && echo ">>> [$*] $@"
+
+# ----------------------------------------------------------------------------
+# Per-accession phony targets: align-<ACC> / call-<ACC> / bench-<ACC>.
+# Generated with $(eval) because GNU make does NOT apply pattern rules to phony
+# targets (a plain `bench-%:` phony rule silently does nothing).
+# $(call ASM_RULES,<Accession>)
+# ----------------------------------------------------------------------------
+define ASM_RULES
+align-$(1): $(OUTDIR)/$(1)/aln.sorted.bam ;
+call-$(1):  $(OUTDIR)/$(1)/variants.vcf ;
+
+bench-$(1): $(OUTDIR)/$(1)/variants.vcf $(REF_NORM)
+	@test -s $(TRUTH_DIR)/$(call lc,$(1))_ground_truth.vcf \
+	  || { echo "ERROR: truth $(TRUTH_DIR)/$(call lc,$(1))_ground_truth.vcf not found" >&2; exit 1; }
+	@echo ">>> [$(1)] normalizing truth + calls -> $(BENCH_CHROM)"
+	zcat -f $(TRUTH_DIR)/$(call lc,$(1))_ground_truth.vcf \
+	  | awk 'BEGIN{FS=OFS="\t"} /^##contig=<ID=/{sub(/ID=[^,>]+/,"ID=$(BENCH_CHROM)")} /^#/{print;next} {$$$$1="$(BENCH_CHROM)";print}' \
+	  | $(BCFTOOLS) sort -Oz -o $(OUTDIR)/$(1)/truth.vcf.gz -
+	$(TABIX) -f -p vcf $(OUTDIR)/$(1)/truth.vcf.gz
+	zcat -f $(OUTDIR)/$(1)/variants.vcf \
+	  | awk 'BEGIN{FS=OFS="\t"} /^##contig=<ID=/{sub(/ID=[^,>]+/,"ID=$(BENCH_CHROM)")} /^#/{print;next} {$$$$1="$(BENCH_CHROM)";print}' \
+	  | $(BCFTOOLS) sort -Oz -o $(OUTDIR)/$(1)/calls.vcf.gz -
+	$(TABIX) -f -p vcf $(OUTDIR)/$(1)/calls.vcf.gz
+	@echo ">>> [$(1)] truvari bench (vs SILVER truth)"
+	@rm -rf $(OUTDIR)/$(1)/truvari
+	$(TRUVARI) bench -b $(OUTDIR)/$(1)/truth.vcf.gz -c $(OUTDIR)/$(1)/calls.vcf.gz \
+	    -f $(REF_NORM) -o $(OUTDIR)/$(1)/truvari $(TRUVARI_OPTS)
+	-$(STRATIFY) --bench-dir $(OUTDIR)/$(1)/truvari --out $(OUTDIR)/$(1)/truvari.stratified.tsv >/dev/null 2>&1
+	@{ \
+	  echo "==================================================================="; \
+	  echo " SVIM-asm benchmark (SILVER truth): Nipponbare vs $(1)"; \
+	  echo " date    : $$$$(date '+%F %T')"; \
+	  echo " query   : $(PANSN_DIR)/$(1)_chr1.$(EXT)   (minimap2 -x $(MM2_PRESET))"; \
+	  echo " truth   : $(TRUTH_DIR)/$(call lc,$(1))_ground_truth.vcf  (validated $(1) SVs)"; \
+	  echo " opts    : $(TRUVARI_OPTS)"; \
+	  echo " NOTE    : silver truth -> RECALL is the metric; precision is a lower bound."; \
+	  echo "==================================================================="; \
+	  echo; echo "-- summary.json --"; cat $(OUTDIR)/$(1)/truvari/summary.json 2>/dev/null; echo; \
+	  echo "-- Stratified (size-bin x type; BND=translocation) --"; \
+	  column -t $(OUTDIR)/$(1)/truvari.stratified.tsv 2>/dev/null || echo "(unavailable)"; \
+	} | tee $(OUTDIR)/$(1)/svimasm.$(1).log
+	@echo ">>> log: $(OUTDIR)/$(1)/svimasm.$(1).log"
+endef
+$(foreach a,$(ACCESSIONS),$(eval $(call ASM_RULES,$(a))))
+
+# ----------------------------------------------------------------------------
+summary:
+	@printf '%-16s %8s %10s %6s\n' "accession" "recall" "precision" "f1"
+	@for a in $(ACCESSIONS); do \
+	  s=$(OUTDIR)/$$a/truvari/summary.json; \
+	  if [ -f "$$s" ]; then \
+	    printf '%-16s ' "$$a"; \
+	    python3 -c "import json;d=json.load(open('$$s'));print('%8.4f %10.4f %6.4f'%(d['recall'],d['precision'],d['f1']))"; \
+	  else echo "$$a: not benchmarked yet"; fi; \
+	done
+	@echo "(silver truth: recall is the metric; precision is a lower bound)"
+
+help:
+	@echo "SVIM-asm real arm: Nipponbare vs $(ACCESSIONS) (single-reference)."
+	@echo ""
+	@echo "  install            build conda env '$(ENV)'"
+	@echo "  call | vcf         both accessions: align -> svim-asm VCFs (NO benchmark)"
+	@echo "  all                both accessions: align -> call -> bench"
+	@echo "  align[-<ACC>]      minimap2 -> BAM        (e.g. align-IR64)"
+	@echo "  call-<ACC>         svim-asm -> variants.vcf (one accession)"
+	@echo "  bench[-<ACC>]      truvari vs silver truth -> svimasm.<ACC>.log"
+	@echo "  summary            recall/precision/f1 per accession"
+	@echo ""
+	@echo "Config:"
+	@echo "  ACCESSIONS=$(ACCESSIONS)  THREADS=$(THREADS)  MM2_PRESET=$(MM2_PRESET)"
+	@echo "  PANSN_DIR=$(PANSN_DIR)   REF=$(REF)"
+	@echo "  TRUTH_DIR=$(TRUTH_DIR)   OUTDIR=$(OUTDIR)   BENCH_CHROM=$(BENCH_CHROM)"
+	@echo "  RUN='$(RUN)'   TRUVARI_OPTS=$(TRUVARI_OPTS)"
+
+clean:
+	rm -rf $(OUTDIR)

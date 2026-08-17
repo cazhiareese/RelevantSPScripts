@@ -1,0 +1,161 @@
+# =============================================================================
+# Makefile.benchmark (REAL-SV arm) — score pangenome/svim-asm callsets against
+# the dotplot-validated SILVER-STANDARD truth, per accession.
+# =============================================================================
+#
+# Loops  accession x graph x method  and benchmarks each against that
+# accession's ground-truth VCF (validated IR64 / Azucena SVs, Nipponbare frame).
+#
+#   accession -> filters the multi-sample callset to that sample AND selects
+#                which per-accession truth to compare against.
+#
+# IMPORTANT — this is a SILVER truth (only the SVs you validated, not
+# exhaustive). So a callset SV absent from the truth may be a REAL SV you didn't
+# validate, NOT a false positive. => RECALL is the trustworthy metric;
+# precision is a LOWER BOUND (adjudicate extras by dotplot).
+#
+# Run (after building graphs + producing callsets):
+#   make -f Makefile.benchmark bench                       # everything available
+#   make -f Makefile.benchmark bench-IR64                  # all graphs/methods, IR64
+#   make -f Makefile.benchmark bench-IR64-pggb-vcfwave     # one run
+#   make -f Makefile.benchmark summary                     # recall/precision table
+#
+# Callset sources (multi-sample: IR64, Azucena, Nipponbare columns):
+#   vcfwave -> $(VCF_DIR)/<graph>.vcfwave.vcf.gz   (vg deconstruct|vcfbub|vcfwave)
+#   swave   -> <graph>-swave/swave.sample_level.split.vcf.gz  (external)
+# =============================================================================
+
+SHELL          := /bin/bash
+.SHELLFLAGS    := -o pipefail -c
+.DELETE_ON_ERROR:
+
+# ---- Configuration (override on the command line) ---------------------------
+ACCESSIONS     ?= IR64 Azucena
+GRAPHS         ?= cactus pggb minigraph
+METHODS        ?= vcfwave swave
+
+REF_FASTA      ?= nipponbare_chr1.fna
+BENCH_CHROM    ?= chr1
+BENCH_DIR      ?= truvari_real
+VCF_DIR        ?= graphs/vcf
+
+# Per-accession truth VCFs: $(TRUTH_DIR)/<lc-accession>_ground_truth.vcf
+TRUTH_DIR      ?= ../bio_align/ground_truth
+
+# Tools (override to use containers / conda: RUN="conda run -n <env>")
+RUN            ?=
+BCFTOOLS       ?= $(RUN) bcftools
+TABIX          ?= $(RUN) tabix
+SAMTOOLS       ?= $(RUN) samtools
+TRUVARI        ?= conda run -n truvari truvari
+STRATIFY       ?= python3 ../simulation/stratify_truvari.py
+
+# Truvari matching. --bnddist matches translocation (BND) breakends by proximity;
+# --dup-to-ins folds DUP; --typeignore accommodates caller type labels. Silver
+# truth -> pctseq 0. Lenient by default (see recall caveat above).
+TRUVARI_OPTS   ?= --pctseq 0 --pctsize 0.5 --refdist 1000 --sizemin 50 \
+                  --sizemax 125000 --dup-to-ins --typeignore --bnddist 500
+
+# ---- Derived ----------------------------------------------------------------
+lc = $(shell printf '%s' '$(1)' | tr '[:upper:]' '[:lower:]')
+REF_NORM       := $(BENCH_DIR)/ref.fa
+
+# Callset source path.  $(call CALLSET,<graph>,<method>)
+CALLSET = $(if $(filter swave,$(2)),$(1)-swave/swave.sample_level.split.vcf.gz,$(VCF_DIR)/$(1).$(2).vcf.gz)
+
+# Every (accession,graph,method) run directory (for summary).
+RUN_DIRS := $(foreach a,$(ACCESSIONS),$(foreach g,$(GRAPHS),$(foreach m,$(METHODS),$(BENCH_DIR)/$(a).$(g).$(m))))
+
+.PHONY: bench summary help clean $(foreach a,$(ACCESSIONS),bench-$(a))
+.DEFAULT_GOAL := help
+
+# ---- Reference FASTA: reheader single contig to $(BENCH_CHROM) --------------
+$(REF_NORM): $(REF_FASTA)
+	@mkdir -p $(BENCH_DIR)
+	sed '1s/^>.*/>$(BENCH_CHROM)/' $(REF_FASTA) > $@
+	$(SAMTOOLS) faidx $@
+
+# ---- Per-accession truth: rename contig -> $(BENCH_CHROM), sort, index ------
+# $(BENCH_DIR)/truth.<ACC>.vcf.gz
+define TRUTH_RULE
+$(BENCH_DIR)/truth.$(1).vcf.gz: $(TRUTH_DIR)/$(call lc,$(1))_ground_truth.vcf
+	@mkdir -p $(BENCH_DIR)
+	zcat -f $$< \
+	  | awk 'BEGIN{FS=OFS="\t"} /^##contig=<ID=/{sub(/ID=[^,>]+/,"ID=$(BENCH_CHROM)")} /^#/{print;next} {$$$$1="$(BENCH_CHROM)";print}' \
+	  | $(BCFTOOLS) sort -Oz -o $$@ -
+	$(TABIX) -f -p vcf $$@
+endef
+$(foreach a,$(ACCESSIONS),$(eval $(call TRUTH_RULE,$(a))))
+
+# ---- Per (accession,graph,method) benchmark ---------------------------------
+# $(call BENCHRULE,<accession>,<graph>,<method>)
+define BENCHRULE
+bench-$(1)-$(2)-$(3): $(BENCH_DIR)/truth.$(1).vcf.gz $(REF_NORM)
+	@mkdir -p $(BENCH_DIR)
+	@set -e; \
+	 src="$(call CALLSET,$(2),$(3))"; \
+	 out="$(BENCH_DIR)/$(1).$(2).$(3)"; norm="$$$$out.vcf.gz"; log="$$$$out.log"; \
+	 truth="$(BENCH_DIR)/truth.$(1).vcf.gz"; \
+	 if [ ! -s "$$$$src" ]; then echo "SKIP [$(1) x $(2) x $(3)]: callset not found ($$$$src)" >&2; exit 0; fi; \
+	 echo ">>> [$(1) x $(2) x $(3)] filter to $(1), split, normalize"; \
+	 $(BCFTOOLS) norm -m -any "$$$$src" -Ov 2>/dev/null \
+	   | $(BCFTOOLS) view -s $(1) --min-ac 1 -Ov - \
+	   | awk 'BEGIN{FS=OFS="\t"} /^##contig=<ID=/{sub(/ID=[^,>]+/,"ID=$(BENCH_CHROM)")} /^#/{print;next} {$$$$1="$(BENCH_CHROM)";print}' \
+	   | $(BCFTOOLS) sort -Oz -o "$$$$norm" -; \
+	 $(TABIX) -f -p vcf "$$$$norm"; \
+	 echo ">>> truvari bench"; rm -rf "$$$$out"; \
+	 $(TRUVARI) bench -b "$$$$truth" -c "$$$$norm" -f $(REF_NORM) -o "$$$$out" $(TRUVARI_OPTS); \
+	 $(STRATIFY) --bench-dir "$$$$out" --out "$$$$out.stratified.tsv" >/dev/null 2>&1 || true; \
+	 { \
+	   echo "==================================================================="; \
+	   echo " REAL-SV benchmark (SILVER truth): $(1)  x  $(2)  x  $(3)"; \
+	   echo " date    : $$$$(date '+%F %T')"; \
+	   echo " truth   : $(TRUTH_DIR)/$(call lc,$(1))_ground_truth.vcf  (validated $(1) SVs)"; \
+	   echo " callset : $$$$src   (filtered to sample $(1))"; \
+	   echo " opts    : $(TRUVARI_OPTS)"; \
+	   echo " NOTE    : silver truth -> RECALL is the metric; precision is a lower bound."; \
+	   echo "==================================================================="; \
+	   echo; echo "-- summary.json --"; cat "$$$$out/summary.json" 2>/dev/null; echo; \
+	   echo "-- Stratified (size-bin x type; BND=translocation) --"; \
+	   column -t "$$$$out.stratified.tsv" 2>/dev/null || echo "(unavailable)"; \
+	 } | tee "$$$$log"; \
+	 echo ">>> log: $$$$log"
+endef
+$(foreach a,$(ACCESSIONS),$(foreach g,$(GRAPHS),$(foreach m,$(METHODS),$(eval $(call BENCHRULE,$(a),$(g),$(m))))))
+
+# Aggregate targets
+$(foreach a,$(ACCESSIONS),$(eval bench-$(a): $(foreach g,$(GRAPHS),$(foreach m,$(METHODS),bench-$(a)-$(g)-$(m)))))
+bench: $(foreach a,$(ACCESSIONS),bench-$(a))
+
+# Recall-focused headline across every completed run.
+summary:
+	@printf '%-28s %8s %10s %6s\n' "accession.graph.method" "recall" "precision" "f1"
+	@for d in $(RUN_DIRS); do \
+	  s=$$d/summary.json; \
+	  if [ -f "$$s" ]; then \
+	    printf '%-28s ' "$$(basename $$d)"; \
+	    python3 -c "import json;x=json.load(open('$$s'));print('%8.4f %10.4f %6.4f'%(x['recall'],x['precision'],x['f1']))"; \
+	  fi; \
+	done
+	@echo "(silver truth: recall is the metric; precision is a lower bound)"
+
+help:
+	@echo "REAL-SV arm benchmark vs dotplot-validated silver truth (per accession)."
+	@echo ""
+	@echo "  bench                         all accession x graph x method"
+	@echo "  bench-<ACC>                   e.g. bench-IR64 / bench-Azucena"
+	@echo "  bench-<ACC>-<graph>-<method>  e.g. bench-IR64-pggb-vcfwave"
+	@echo "  summary                       recall/precision/f1 for all runs"
+	@echo ""
+	@echo "Config:"
+	@echo "  ACCESSIONS = $(ACCESSIONS)"
+	@echo "  GRAPHS     = $(GRAPHS)"
+	@echo "  METHODS    = $(METHODS)"
+	@echo "  TRUTH_DIR  = $(TRUTH_DIR)   (<acc>_ground_truth.vcf)"
+	@echo "  REF_FASTA  = $(REF_FASTA)   BENCH_CHROM=$(BENCH_CHROM)"
+	@echo "  BENCH_DIR  = $(BENCH_DIR)   VCF_DIR=$(VCF_DIR)"
+	@echo "  TRUVARI    = $(TRUVARI)"
+	@echo "  TRUVARI_OPTS = $(TRUVARI_OPTS)"
+
+clean:
+	rm -rf $(BENCH_DIR)
