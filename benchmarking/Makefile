@@ -68,7 +68,7 @@ TRUVARI        ?= $(VENV)/bin/truvari
 PYTHON         ?= $(VENV)/bin/python
 BCFTOOLS       ?= bcftools
 TABIX          ?= tabix
-STRATIFY       ?= $(PYTHON) ../simulation/stratify_truvari.py
+STRATIFY       ?= $(PYTHON) ../helper-scripts/stratify_truvari.py
 
 # Truvari matching. Symbolic truth -> --pctseq 0 (no reference FASTA needed).
 # --bnddist matches translocation (BND) breakends by proximity; --dup-to-ins folds
