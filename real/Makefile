@@ -32,7 +32,7 @@ SHELL          := /bin/bash
 
 # ---- Configuration (override on the command line) ---------------------------
 # Real cultivars only — Simulated is intentionally absent. FIRST = reference.
-CULTIVARS      ?= Nipponbare IR64 Azucena
+CULTIVARS      ?= Nipponbare IR64 Azucena 
 REFERENCE      ?= $(firstword $(CULTIVARS))
 
 THREADS        ?= 32
