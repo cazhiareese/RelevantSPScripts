@@ -4,6 +4,10 @@
 ### Swave command
 
 ```
+find ~ -type f -path "*/venv-cactus-v3.2.1/bin/activate"
+
+# activate from output above
+
 python ~/clleva/tools/Swave/Swave.py call \
     --input_path assemblies.tsv \
     --ref_path  /home/rocm-user/clleva/real_arm/graphs/pansn/Nipponbare_chr1.fna \
